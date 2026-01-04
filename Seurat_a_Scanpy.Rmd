@@ -1,0 +1,57 @@
+---
+title: "Seurat a objeto Scanpy"
+author: "Sheila Santomé"
+date: "2025-09-02"
+output: html_document
+---
+
+En esta libreta de código se describe el proceso para convertir los objetos Seurat de cada conjunto de datos en los cuatro archivos que servirán como punto de partida para el análisis con Scanpy. Estos archivos incluyen:
+
+-   Un archivo con el metadata, que corresponderá a la dimensión .obs del objeto AnnData en Scanpy.
+
+-   Un archivo .mtx que contiene las cuentas de expresión génica.
+
+-   Dos archivos de texto (.txt) adicionales que incluyen la información de genes y células, respectivamente.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Importación de librerías
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(Matrix)
+```
+
+## Generar Metadata
+
+Este bloque de código extrae la información de **metadata** contenida en el objeto **Seurat** y la prepara para su exportación. Primero, convierte los nombres de las filas del objeto —que corresponden a los identificadores únicos de cada célula— en una columna llamada `cell_id`, lo que facilita su manejo en otros entornos de análisis. Luego, se guarda la tabla resultante en un archivo **CSV** llamado `metadata.csv`, que podrá emplearse posteriormente como la dimensión `.obs` del objeto **AnnData** en **Scanpy**, asegurando la compatibilidad entre ambos entornos de análisis de datos de transcriptómica unicelular. En este caso, se empleará el objeto Seurat de la muestra de `seurat_pool_after.rds`
+
+```{r}
+
+metadata <- seurat_pool_after@meta.data
+
+metadata <- metadata %>%
+  rownames_to_column("cell_id")
+
+write.csv(metadata, "metadata_pool_after.csv", row.names = TRUE)
+
+metadata
+```
+
+## Obtener los counts crudos
+
+Este bloque de código exporta la información principal del objeto **Seurat** en los formatos necesarios para construir un objeto **AnnData** en **Scanpy**. En primer lugar, la función `writeMM()` guarda la matriz de conteos de expresión génica (`counts`) del ensayo **RNA** en un archivo **Matrix Market (.mtx)**, que contiene los valores de expresión de cada gen en cada célula. A continuación, se generan dos archivos de texto: uno con los **nombres de los genes** (`genes.txt`) y otro con los **identificadores de las células** (`cells.txt`). Estos tres archivos —junto con la metadata exportada previamente— constituyen la estructura básica necesaria para importar los datos en **Scanpy** y continuar el análisis en Python.
+
+```{r}
+
+writeMM(seurat_pool_after[["RNA"]]@counts, file = "counts_pool_after.mtx")
+
+write.table(rownames(seurat_pool_after), "genes_pool_after.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+write.table(colnames(seurat_pool_after), "cells_pool_after.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+```

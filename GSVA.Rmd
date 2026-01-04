@@ -1,0 +1,486 @@
+---
+title: "Análisis mediente GSVA"
+author: "Sheila"
+date: "2025-09-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+En esta libreta de código se describe el protocolo seguido para analizar las **alteraciones en las rutas metabólicas** presentes en los datos de los **ratones y los dos pools**, utilizando la herramienta **GSVA** disponible en el [repositorio de GitHub](https://github.com/rcastelo/GSVA/tree/devel).
+
+El procedimiento implementado se basa en el [tutorial original de *refine.bio examples*](https://alexslemonade.github.io/refinebio-examples/03-rnaseq/pathway-analysis_rnaseq_03_gsva.html#44_Perform_DESeq2_normalization_and_transformation), con modificaciones adaptadas a las características de los datos y objetivos del análisis.
+
+# Instalación de paquetes e importación de librerías
+
+```{r packs}
+if (!("DESeq2" %in% installed.packages())) {
+  BiocManager::install("DESeq2", update = FALSE)
+}
+
+if (!("GSVA" %in% installed.packages())) {
+  BiocManager::install("GSVA", update = FALSE)
+}
+
+if (!("qusage" %in% installed.packages())) {
+  BiocManager::install("qusage", update = FALSE)
+}
+
+if (!("org.Hs.eg.db" %in% installed.packages())) {
+  BiocManager::install("org.Hs.eg.db", update = FALSE)
+}
+
+if (!("pheatmap" %in% installed.packages())) {
+  install.packages("pheatmap", update = FALSE)
+}
+
+```
+
+```{r}
+library(DESeq2)
+
+library(qusage)
+
+library(GSVA)
+
+library(org.Hs.eg.db)
+
+library(magrittr)
+
+library(tibble)
+
+library(msigdbr)
+
+library(org.Mm.eg.db)
+
+library(arrow)
+
+library(ggplot2)
+
+library(tidyr)
+
+library(dplyr)
+
+library(patchwork)
+
+library(writexl)
+
+
+```
+
+## Cargar los datos
+
+En este bloque se cargan los datos generados en la libreta **Preparacion_GSVA_y_Bitfam.ipynb**, que incluye la **matriz de conteo génico sin normalizar** (con los nombres de los genes en formato **Ensembl ID**) y la **metadata** asociada, la cual contiene toda la información descriptiva correspondiente a cada célula analizada.
+
+```{r cargar datos}
+
+# Leer archivo feather
+vst_df <- read_feather("GSVA_cluster0_pool_after.feather") %>% tibble::column_to_rownames("Gene stable ID")
+
+# Revisar
+head(vst_df)
+
+
+```
+
+```{r}
+metadata <- read.csv("metadata_cluster0_pool_after.csv", row.names = 1)
+
+metadata <- metadata[!is.na(metadata$condition) & metadata$condition != "", ]
+
+
+head(metadata)
+
+vst_df <- vst_df[, rownames(metadata)]
+
+
+```
+
+Este bloque de código verifica que los **nombres de las columnas de la matriz normalizada (`vst_df`)** y los **nombres de las filas de la metadata** coincidan completamente, asegurando que ambas estructuras estén correctamente alineadas antes de continuar con el análisis.
+
+```{r}
+all(colnames(vst_df) %in% rownames(metadata))  # TRUE si todos coinciden
+all(rownames(metadata) %in% colnames(vst_df))  # TRUE si todos coinciden
+
+```
+
+# Creación del objeto DEDSeq2
+
+En esta sección se construye el objeto **DESeqDataSet** a partir de la matriz de conteos normalizados (`vst_df`) y la metadata correspondiente.\
+Primero, se filtraron los genes con **baja expresión**, eliminando aquellos con suma total igual a cero o con menos de dos muestras que presentaran al menos 10 conteos, garantizando así una mejor calidad en el análisis.\
+Posteriormente, se realizaron comprobaciones para asegurar la **integridad de los datos**, verificando la ausencia de valores no enteros, negativos o faltantes (`NA`). A continuación, se calcularon los **factores de tamaño** empleando la media geométrica de los conteos, necesaria para la normalización entre muestras.\
+Finalmente, se aplicó la **transformación estabilizadora de la varianza (VST)**, obteniendo una matriz transformada (`vst_df`) que reduce la dependencia entre la media y la varianza, optimizando así la comparabilidad entre genes y condiciones experimentales.
+
+```{r}
+
+dds <- DESeqDataSetFromMatrix(
+  countData = vst_df, 
+  colData = metadata, 
+  design = ~1 
+)
+```
+
+```{r norm}
+
+dds <- dds[rowSums(counts(dds)) > 0, ]
+
+dds <- dds[rowSums(counts(dds) >= 10) >= 2, ]
+
+```
+
+```{r}
+any(counts(dds) %% 1 != 0)
+
+sum(rowSums(counts(dds)) == 0)
+
+any(is.na(counts(dds))) 
+
+any(counts(dds) < 0)         
+
+```
+
+```{r}
+
+geoMeans <- apply(counts(dds), 1, function(x) {
+  if (all(x == 0)) return(NA)
+  exp(mean(log(x[x > 0])))
+})
+
+dds <- estimateSizeFactors(dds, geoMeans = geoMeans)
+
+vsd <- varianceStabilizingTransformation(dds)
+
+```
+
+```{r}
+vst_df <- assay(vsd) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("ensembl_id")
+
+```
+
+# Importar Set de Genes
+
+En esta sección se descargan los **conjuntos de genes Hallmark** del paquete `msigdbr`, seleccionando específicamente aquellos correspondientes a la especie **Mus musculus** y a la categoría **H (Hallmark gene sets)**. Estos conjuntos representan rutas y procesos biológicos bien caracterizados, lo que permite evaluar de manera global la **actividad de vías metabólicas y de señalización** a partir de los datos de expresión génica.
+
+\
+Posteriormente, los genes se agrupan por ruta utilizando la función `split()`, generando una lista estructurada (`hallmarks_list`) que servirá como **entrada para el análisis GSVA**, facilitando la identificación de patrones funcionales diferenciales entre condiciones experimentales.
+
+```{r}
+hallmark_gene_sets <- msigdbr::msigdbr(
+  species = "Mus musculus",  # Ratón, cambiar en caso de trabajar con otra especie
+  category = "H"             # Solo Hallmark gene sets
+)
+head(hallmark_gene_sets)
+
+```
+
+```{r}
+
+hallmarks_list <- split(
+  hallmark_gene_sets$entrez_gene, 
+  hallmark_gene_sets$gs_name 
+)
+head(hallmarks_list, n = 2)
+
+
+```
+
+```{r}
+keytypes(org.Mm.eg.db)
+
+```
+
+```{r}
+
+mapped_df <- data.frame(
+  "entrez_id" = mapIds(
+    org.Mm.eg.db, # Modificar en caso de estar trabajando con otras especie
+    keys = vst_df$ensembl_id,
+    # Modificar en caso de estar trabajando con otro tipo de ID
+    keytype = "ENSEMBL",
+    
+    column = "ENTREZID",
+    
+    multiVals = "first" # Solo se guarda el primer valor mapeado para el gen
+  )
+) %>%
+   # Si un identificador de gen Ensembl no tiene correspondencia con un identificador de gen Entrez,
+  # se elimina del data frame
+  dplyr::filter(!is.na(entrez_id)) %>%
+    # Crear una columna llamada `Ensembl` para almacenar los nombres de las filas
+  tibble::rownames_to_column("Ensembl") %>%
+  dplyr::inner_join(vst_df, by = c("Ensembl" = "ensembl_id"))
+```
+
+```{r}
+head(mapped_df)
+sum(duplicated(mapped_df$entrez_id))
+
+```
+
+### Manejo Duplicados
+
+```{r}
+# Se determina la media de expresión de cada gen
+gene_means <- rowMeans(mapped_df %>% dplyr::select(-Ensembl, -entrez_id))
+
+
+mapped_df <- mapped_df %>%
+  # Añadimos la columna a el df
+  dplyr::mutate(gene_means) %>%
+  dplyr::select(Ensembl, entrez_id, gene_means, dplyr::everything())
+filtered_mapped_df <- mapped_df %>%
+  # Ordenar de mayor a menos
+  dplyr::arrange(dplyr::desc(gene_means)) %>%
+  # Filtrar duplicados en caso de haberlos
+  dplyr::distinct(entrez_id, .keep_all = TRUE)
+```
+
+```{r}
+filtered_mapped_matrix <- filtered_mapped_df %>%
+  # Eliminar la columna con los IDs de Ensmbl
+  dplyr::select(-Ensembl, -gene_means) %>%
+  tibble::column_to_rownames("entrez_id") %>%
+  # Finalmente, se combierte el df a matriz
+  as.matrix()
+```
+
+## Análisis GSVA
+
+En esta sección se realiza el **análisis GSVA.** Primero, se crea un **objeto de parámetros (`gsvaParam`)**, especificando la matriz de expresión y la lista de conjuntos de genes Hallmark (`hallmarks_list`), y configurando el parámetro `maxDiff = TRUE` para optimizar la sensibilidad del análisis.\
+A continuación, se ejecuta la función `gsva()` para calcular los **scores de actividad de cada vía por muestra**, generando la matriz `gsva_results`.\
+Finalmente, los resultados se transforman a un **data frame**, se agrega una columna con el nombre de la vía (`pathway`) y se exportan a un archivo TSV (`gsva_results_merge.tsv`) para su posterior análisis y visualización.
+
+```{r}
+# Crear objeto de parámetros para GSVA
+gsvapar <- gsvaParam(
+  exprData = filtered_mapped_matrix,  # matriz de expresión
+  geneSets = hallmarks_list,          #  lista de gene sets
+  maxDiff = TRUE                       # parámetro específico de gsvaParam
+)
+
+# Ejecutar GSVA
+gsva_results <- gsva(gsvapar, verbose = TRUE)
+
+
+```
+
+```{r}
+head(gsva_results[, 1:10])
+
+gsva_results %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("pathway") %>%
+  readr::write_tsv(file.path(
+    "gsva_results_merge.tsv" #Cambiar nombre dependiendo del dataset que estemos analizando
+  ))
+
+```
+
+## Análisis de resultados
+
+En esta sección se lleva a cabo la **visualización y análisis de los resultados de GSVA** para las diferentes condiciones experimentales. Primero, se crea un **data frame de anotaciones (`annot_df`)** a partir de la metadata, que se utiliza para agregar información de condición a las columnas del **heatmap**, permitiendo identificar visualmente la distribución de la actividad de vías biológicas entre muestras.
+
+Se genera un **heatmap global** de todas las vías, y posteriormente se reordenan las columnas según un orden predefinido de condiciones, desactivando el clustering de columnas para mantener la coherencia con el diseño experimental.
+
+Además, se transforma la matriz de resultados a formato **long** y se combina con la metadata para permitir la visualización individual de vías mediante gráficos de violín y boxplots, mostrando la distribución de la actividad de una vía específica (por ejemplo, `HALLMARK_TNFA_SIGNALING_VIA_NFKB`) en cada condición.
+
+A continuación, se calculan las **medias de actividad por vía** para la condición `plus_trp`, identificando las vías más activadas y más reprimidas en esta condición.\
+Se realiza un **análisis estadístico** mediante test t para comparar `plus_trp` frente a `control_1`, ajustando los valores p por el método de Benjamini-Hochberg.
+
+Finalmente, se generan **gráficos de barras** con las 20 vías más significativamente activadas y reprimidas, combinando ambos plots para facilitar la interpretación de los cambios funcionales en la condición `plus_trp`.
+
+```{r}
+annot_df <- metadata %>%
+  tibble::rownames_to_column("sample_id") %>%  
+  dplyr::select(sample_id, condition) %>% #Cambiar por la columna del metadata por la que se quiera  analizar
+  dplyr::group_by(condition) %>% #Cambiar aquí también
+  tibble::column_to_rownames("sample_id")
+
+head(annot_df)
+
+```
+
+### Heatmap de las rutas metabólicas
+
+```{r heatmap}
+pathway_heatmap <- pheatmap::pheatmap(
+  gsva_results,
+  annotation_col = annot_df,
+  show_colnames = FALSE,
+  fontsize_row = 6,   
+  width = 12, height = 10     
+)
+
+
+pathway_heatmap
+```
+
+```{r}
+# Ordenar las muestras por condición o por leiden
+condition_order <- c("control_1", "control_2", "no_lys", "no_met", 
+                    "no_thr", "no_trp", "plus_his", "plus_lys", "plus_met", 
+                    "plus_phe", "plus_thr", "no_his","plus_trp")
+leiden_order <- c("0","1","2","3")
+
+condition_order_2 <- c("control", "plus_trp")
+
+# Reordenar el dataframe de resultados según el orden deseado, cambiar dependiendo de si se está analizando condiciones o clústers
+sample_order <- rownames(annot_df)[order(match(annot_df$condition, condition_order_2))]
+gsva_ordered <- gsva_results[, sample_order]
+
+pathway_heatmap <- pheatmap::pheatmap(
+  gsva_ordered,
+  annotation_col = annot_df,
+  show_colnames = FALSE,
+  cluster_cols = FALSE,  
+  fontsize_row = 6,
+  width = 12, 
+  height = 10
+)
+
+```
+
+### Rutas afectadas para cada condición
+
+En esta libreta se muestran únicamente dos ejemplos de comparación de condiciones; sin embargo, para realizar análisis adicionales con otras condiciones, bastaría con **repetir el bloque correspondiente** y **modificar los nombres de las condiciones** según sea necesario, aplicando el mismo flujo de cálculo de medias, test estadístico y visualización de resultados.
+
+```{r}
+# Transponer la matriz para que las filas sean muestras y columnas pathways
+gsva_df <- as.data.frame(t(gsva_results))
+
+# Añadir columna con condición en caso de querer analizar los clusters cambiar la columna
+gsva_df$condition <- annot_df$condition
+```
+
+#### Análisis de la condición de plus_trp
+
+```{r}
+# Filtrar solo condiciones que queremos comparar
+gsva_df2 <- gsva_df %>% filter(condition %in% c("plus_trp", "control"))
+
+pathway_stats <- gsva_df2 %>%
+  pivot_longer(cols = -condition, names_to = "pathway", values_to = "score") %>%
+  group_by(pathway) %>%
+  summarise(
+    p_value = if(n_distinct(condition) == 2) t.test(score ~ condition)$p.value else NA_real_,
+    mean_plus_trp = mean(score[condition == "plus_trp"]),
+    mean_control = mean(score[condition == "control"]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    adj_p = p.adjust(p_value, method = "BH")
+  ) %>%
+  arrange(adj_p)
+
+pathway_stats <- pathway_stats %>%
+  mutate(
+    diff = mean_plus_trp - mean_control
+  )
+
+
+head(pathway_stats)
+
+
+```
+
+```{r}
+write_xlsx(pathway_stats, "pathway_stats_merged_plus_trp.xlsx")
+
+```
+
+```{r}
+# Filtrar vías significativas
+significant_pathways <- pathway_stats %>%
+  filter(!is.na(adj_p))  # eliminar NA
+
+# Top 20 upregulated
+top_up <- significant_pathways %>%
+  filter(diff > 0) %>%
+  arrange(adj_p) %>%
+  head(20)
+
+# Top 20 downregulated
+top_down <- significant_pathways %>%
+  filter(diff < 0) %>%
+  arrange(adj_p) %>%
+  head(20) %>%
+  mutate(score_plot = -log10(adj_p) * -1)
+
+
+# Plotear
+p1 <- ggplot(top_up, aes(x = reorder(pathway, -log10(adj_p)), y = -log10(adj_p))) +
+  geom_bar(stat = "identity", fill = "purple") +
+  coord_flip() +
+  theme_bw() +
+  ylab("-log10(adj_p)") +
+  xlab("Pathway") +
+  ggtitle("Top 20 vías activadas en plus_trp")
+
+
+p2 <- ggplot(top_down, aes(x = reorder(pathway, -log10(adj_p)), y = score_plot)) +
+  geom_bar(stat = "identity", fill = "pink") +
+  coord_flip() +
+  theme_bw() +
+  ylab("-log10(adj_p)") +
+  xlab("Pathway") +
+  ggtitle("Top 20 vías reprimidas en plus_trp")
+
+# Juntar plots
+p1 / p2
+```
+
+```{r}
+library(ggrepel)
+
+ggplot(significant_pathways, aes(x = diff, y = -log10(adj_p))) +
+  geom_point(aes(color = diff > 0), size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_text_repel(aes(label = pathway),
+                  size = 3,
+                  max.overlaps = 20,
+                  box.padding = 0.4,
+                  segment.color = "gray70") +
+  scale_color_manual(values = c("pink", "purple"),
+                     labels = c("Downregulated", "Upregulated"),
+                     name = "Regulation") +
+  theme_bw() +
+  labs(
+    x = "Mean difference (plus_trp - control)",
+    y = "-log10(adj_p)",
+    title = "Pathway activity changes in plus_trp vs control"
+  )
+
+
+```
+
+#### Plot para rutas específicas
+
+```{r}
+# Convertir gsva_results a formato long y unir con annot_df
+df <- as.data.frame(t(gsva_results))
+df$sample <- rownames(df)
+
+df <- df %>%
+  dplyr::left_join(annot_df %>% tibble::rownames_to_column("sample"),
+                   by = "sample")
+
+# Plot para una vía específica
+ggplot(df, aes(x = condition, 
+               y = HALLMARK_FATTY_ACID_METABOLISM, # Cambiar por la ruta que se quiera graficar
+               fill = condition)) +
+  geom_violin(trim = FALSE) +
+    scale_fill_manual(values = c("control" = "pink", "plus_trp" = "purple")) +
+  geom_boxplot(width = 0.2, outlier.shape = NA) +
+  theme_bw()
+
+
+```
+
+```{r}
+write_xlsx(pathway_stats, "pathway_stats_merged_no_trp.xlsx")
+
+```
